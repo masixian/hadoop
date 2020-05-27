@@ -404,6 +404,10 @@
     <Class name="org.apache.hadoop.yarn.server.nodemanager.security.authorize.NMPolicyProvider" />
     <Bug pattern="EI_EXPOSE_REP" />
   </Match>
+  <Match>
+    <Class name="org.apache.hadoop.yarn.server.router.security.authorize.RouterPolicyProvider" />
+    <Bug pattern="EI_EXPOSE_REP" />
+  </Match>
 
 
   <!-- Ignore EI_EXPOSE_REP2 in Log services -->
@@ -695,4 +699,10 @@
     <Bug pattern="NP_NONNULL_PARAM_VIOLATION"/>
   </Match>
 
+  <!-- Device files are always under /dev in production, but it's necessary to override in tests -->
+  <Match>
+    <Class name="org.apache.hadoop.yarn.server.nodemanager.containermanager.resourceplugin.com.nec.NECVEPlugin"/>
+    <Method name="getDevices" />
+    <Bug pattern="DMI_HARDCODED_ABSOLUTE_FILENAME" />
+  </Match>
 </FindBugsFilter>

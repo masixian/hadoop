@@ -56,6 +56,8 @@ import org.apache.hadoop.yarn.server.resourcemanager.AdminService;
 import org.apache.hadoop.yarn.server.resourcemanager.MockAM;
 import org.apache.hadoop.yarn.server.resourcemanager.MockNM;
 import org.apache.hadoop.yarn.server.resourcemanager.MockRM;
+import org.apache.hadoop.yarn.server.resourcemanager.MockRMAppSubmissionData;
+import org.apache.hadoop.yarn.server.resourcemanager.MockRMAppSubmitter;
 import org.apache.hadoop.yarn.server.resourcemanager.TestResourceTrackerService.NullNodeAttributeStore;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
@@ -70,7 +72,7 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Generic tests for overcommitting resources. This needs to be instantiated
- * with a scheduler ({@link YarnConfiguration.RM_SCHEDULER}).
+ * with a scheduler ({@link YarnConfiguration#RM_SCHEDULER}).
  *
  * If reducing the amount of resources leads to overcommitting (negative
  * available resources), the scheduler will select containers to make room.
@@ -127,7 +129,8 @@ public abstract class TestSchedulerOvercommit {
     nmId = nm.getNodeId();
 
     // Start an AM with 2GB
-    RMApp app = rm.submitApp(2 * GB);
+    RMApp app = MockRMAppSubmitter.submit(rm,
+        MockRMAppSubmissionData.Builder.createWithMemory(2 * GB, rm).build());
     nm.nodeHeartbeat(true);
     attempt = app.getCurrentAppAttempt();
     am = rm.sendAMLaunched(attempt.getAppAttemptId());
@@ -142,7 +145,7 @@ public abstract class TestSchedulerOvercommit {
    * Get the configuration for the scheduler. This is used when setting up the
    * Resource Manager and should setup the scheduler (e.g., Capacity Scheduler
    * or Fair Scheduler). It needs to set the configuration with
-   * {@link YarnConfiguration.RM_SCHEDULER}.
+   * {@link YarnConfiguration#RM_SCHEDULER}.
    * @return Configuration for the scheduler.
    */
   protected Configuration getConfiguration() {
@@ -367,7 +370,11 @@ public abstract class TestSchedulerOvercommit {
     waitMemory(scheduler, nmId, 4 * GB, 4 * GB, 200, 5 * 1000);
 
     // Start an AM with 2GB
-    RMApp app2 = rm.submitApp(2 * GB, "app2", "user2");
+    RMApp app2 = MockRMAppSubmitter.submit(rm,
+        MockRMAppSubmissionData.Builder.createWithMemory(2 * GB, rm)
+            .withAppName("app2")
+            .withUser("user2")
+            .build());
     nm.nodeHeartbeat(true);
     RMAppAttempt attempt2 = app2.getCurrentAppAttempt();
     MockAM am2 = rm.sendAMLaunched(attempt2.getAppAttemptId());
@@ -531,7 +538,7 @@ public abstract class TestSchedulerOvercommit {
 
   /**
    * Create a container with a particular size and make sure it succeeds.
-   * @param am Application Master to add the container to.
+   * @param app Application Master to add the container to.
    * @param memory Memory of the container.
    * @return Newly created container.
    * @throws Exception If there are issues creating the container.

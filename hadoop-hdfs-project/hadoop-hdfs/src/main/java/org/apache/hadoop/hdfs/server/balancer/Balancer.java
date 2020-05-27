@@ -36,6 +36,8 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
+import com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.hdfs.DFSUtilClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.hadoop.HadoopIllegalArgumentException;
@@ -196,7 +198,14 @@ public class Balancer {
       + "\n\t[-runDuringUpgrade]"
       + "\tWhether to run the balancer during an ongoing HDFS upgrade."
       + "This is usually not desired since it will not affect used space "
-      + "on over-utilized machines.";
+      + "on over-utilized machines."
+      + "\n\t[-asService]\tRun as a long running service.";
+
+  @VisibleForTesting
+  private static volatile boolean serviceRunning = false;
+
+  private static volatile int exceptionsSinceLastBalance = 0;
+  private static volatile int failedTimesSinceLastSuccessfulBalance = 0;
 
   private final Dispatcher dispatcher;
   private final NameNodeConnector nnc;
@@ -254,6 +263,14 @@ public class Balancer {
       throw new HadoopIllegalArgumentException(key + " = " + v  + " <= " + 0);
     }
     return v;
+  }
+
+  static int getExceptionsSinceLastBalance() {
+    return exceptionsSinceLastBalance;
+  }
+
+  static int getFailedTimesSinceLastSuccessfulBalance() {
+    return failedTimesSinceLastSuccessfulBalance;
   }
 
   /**
@@ -610,7 +627,6 @@ public class Balancer {
       final List<DatanodeStorageReport> reports = dispatcher.init();
       final long bytesLeftToMove = init(reports);
       if (bytesLeftToMove == 0) {
-        System.out.println("The cluster is balanced. Exiting...");
         return newResult(ExitStatus.SUCCESS, bytesLeftToMove, 0);
       } else {
         LOG.info( "Need to move "+ StringUtils.byteDesc(bytesLeftToMove)
@@ -672,8 +688,9 @@ public class Balancer {
    * for each namenode,
    * execute a {@link Balancer} to work through all datanodes once.  
    */
-  static int run(Collection<URI> namenodes, final BalancerParameters p,
-      Configuration conf) throws IOException, InterruptedException {
+  static private int doBalance(Collection<URI> namenodes,
+      Collection<String> nsIds, final BalancerParameters p, Configuration conf)
+      throws IOException, InterruptedException {
     final long sleeptime =
         conf.getTimeDuration(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY,
             DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_DEFAULT,
@@ -691,13 +708,12 @@ public class Balancer {
     System.out.println("Time Stamp               Iteration#  Bytes Already Moved  Bytes Left To Move  Bytes Being Moved");
     
     List<NameNodeConnector> connectors = Collections.emptyList();
-    try {
-      connectors = NameNodeConnector.newNameNodeConnectors(namenodes, 
-              Balancer.class.getSimpleName(), BALANCER_ID_PATH, conf,
-              p.getMaxIdleIteration());
-
-      boolean done = false;
-      for(int iteration = 0; !done; iteration++) {
+    boolean done = false;
+    for(int iteration = 0; !done; iteration++) {
+      try {
+        connectors = NameNodeConnector.newNameNodeConnectors(namenodes, nsIds,
+            Balancer.class.getSimpleName(), BALANCER_ID_PATH, conf,
+            p.getMaxIdleIteration());
         done = true;
         Collections.shuffle(connectors);
         for(NameNodeConnector nnc : connectors) {
@@ -718,17 +734,80 @@ public class Balancer {
           } else {
             LOG.info("Skipping blockpool " + nnc.getBlockpoolID());
           }
+          if (done) {
+            System.out.println("The cluster is balanced. Exiting...");
+          }
         }
         if (!done) {
           Thread.sleep(sleeptime);
         }
-      }
-    } finally {
-      for(NameNodeConnector nnc : connectors) {
-        IOUtils.cleanupWithLogger(LOG, nnc);
+      } finally {
+        for(NameNodeConnector nnc : connectors) {
+          IOUtils.cleanupWithLogger(LOG, nnc);
+        }
       }
     }
     return ExitStatus.SUCCESS.getExitCode();
+  }
+
+  static int run(Collection<URI> namenodes, final BalancerParameters p,
+                 Configuration conf) throws IOException, InterruptedException {
+    return run(namenodes, null, p, conf);
+  }
+
+  static int run(Collection<URI> namenodes, Collection<String> nsIds,
+      final BalancerParameters p, Configuration conf)
+      throws IOException, InterruptedException {
+    if (!p.getRunAsService()) {
+      return doBalance(namenodes, nsIds, p, conf);
+    }
+    if (!serviceRunning) {
+      serviceRunning = true;
+    } else {
+      LOG.warn("Balancer already running as a long-service!");
+      return ExitStatus.ALREADY_RUNNING.getExitCode();
+    }
+
+    long scheduleInterval = conf.getTimeDuration(
+          DFSConfigKeys.DFS_BALANCER_SERVICE_INTERVAL_KEY,
+          DFSConfigKeys.DFS_BALANCER_SERVICE_INTERVAL_DEFAULT,
+          TimeUnit.MILLISECONDS);
+    int retryOnException =
+          conf.getInt(DFSConfigKeys.DFS_BALANCER_SERVICE_RETRIES_ON_EXCEPTION,
+              DFSConfigKeys.DFS_BALANCER_SERVICE_RETRIES_ON_EXCEPTION_DEFAULT);
+
+    while (serviceRunning) {
+      try {
+        int retCode = doBalance(namenodes, nsIds, p, conf);
+        if (retCode < 0) {
+          LOG.info("Balance failed, error code: " + retCode);
+          failedTimesSinceLastSuccessfulBalance++;
+        } else {
+          LOG.info("Balance succeed!");
+          failedTimesSinceLastSuccessfulBalance = 0;
+        }
+        exceptionsSinceLastBalance = 0;
+      } catch (Exception e) {
+        if (++exceptionsSinceLastBalance > retryOnException) {
+          // The caller will process and log the exception
+          throw e;
+        }
+        LOG.warn(
+            "Encounter exception while do balance work. Already tried {} times",
+            exceptionsSinceLastBalance, e);
+      }
+
+      // sleep for next round, will retry for next round when it's interrupted
+      LOG.info("Finished one round, will wait for {} for next round",
+          time2Str(scheduleInterval));
+      Thread.sleep(scheduleInterval);
+    }
+    // normal stop
+    return 0;
+  }
+
+  static void stop() {
+    serviceRunning = false;
   }
 
   private static void checkKeytabAndInit(Configuration conf)
@@ -783,7 +862,8 @@ public class Balancer {
         checkReplicationPolicyCompatibility(conf);
 
         final Collection<URI> namenodes = DFSUtil.getInternalNsRpcUris(conf);
-        return Balancer.run(namenodes, parse(args), conf);
+        final Collection<String> nsIds = DFSUtilClient.getNameServiceIds(conf);
+        return Balancer.run(namenodes, nsIds, parse(args), conf);
       } catch (IOException e) {
         System.out.println(e + ".  Exiting ...");
         return ExitStatus.IO_EXCEPTION.getExitCode();
@@ -867,6 +947,9 @@ public class Balancer {
                   + "upgrade. Most users will not want to run the balancer "
                   + "during an upgrade since it will not affect used space "
                   + "on over-utilized machines.");
+            } else if ("-asService".equalsIgnoreCase(args[i])) {
+              b.setRunAsService(true);
+              LOG.info("Balancer will run as a long running service");
             } else {
               throw new IllegalArgumentException("args = "
                   + Arrays.toString(args));

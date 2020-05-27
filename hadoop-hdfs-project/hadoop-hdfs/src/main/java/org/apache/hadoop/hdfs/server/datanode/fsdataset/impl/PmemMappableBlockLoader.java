@@ -18,25 +18,18 @@
 
 package org.apache.hadoop.hdfs.server.datanode.fsdataset.impl;
 
-import com.google.common.base.Preconditions;
 import org.apache.commons.io.IOUtils;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.hdfs.ExtendedBlockId;
-import org.apache.hadoop.hdfs.server.datanode.BlockMetadataHeader;
 import org.apache.hadoop.hdfs.server.datanode.DNConf;
-import org.apache.hadoop.io.nativeio.NativeIO;
-import org.apache.hadoop.util.DataChecksum;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.BufferedInputStream;
-import java.io.DataInputStream;
+import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
-import java.nio.ByteBuffer;
-import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 
 /**
@@ -48,13 +41,21 @@ public class PmemMappableBlockLoader extends MappableBlockLoader {
   private static final Logger LOG =
       LoggerFactory.getLogger(PmemMappableBlockLoader.class);
   private PmemVolumeManager pmemVolumeManager;
+  private boolean cacheRecoveryEnabled;
 
   @Override
-  void initialize(FsDatasetCache cacheManager) throws IOException {
-    LOG.info("Initializing cache loader: PmemMappableBlockLoader.");
-    DNConf dnConf = cacheManager.getDnConf();
-    PmemVolumeManager.init(dnConf.getPmemVolumes());
+  CacheStats initialize(DNConf dnConf) throws IOException {
+    LOG.info("Initializing cache loader: " + this.getClass().getName());
+    PmemVolumeManager.init(dnConf.getPmemVolumes(),
+        dnConf.getPmemCacheRecoveryEnabled());
     pmemVolumeManager = PmemVolumeManager.getInstance();
+    cacheRecoveryEnabled = dnConf.getPmemCacheRecoveryEnabled();
+    // The configuration for max locked memory is shaded.
+    LOG.info("Persistent memory is used for caching data instead of " +
+        "DRAM. Max locked memory is set to zero to disable DRAM cache");
+    // TODO: PMem is not supporting Lazy Writer now, will refine this stats
+    // while implementing it.
+    return new CacheStats(0L);
   }
 
   /**
@@ -62,8 +63,8 @@ public class PmemMappableBlockLoader extends MappableBlockLoader {
    *
    * Map the block and verify its checksum.
    *
-   * The block will be mapped to PmemDir/BlockPoolId-BlockId, in which PmemDir
-   * is a persistent memory volume chosen by PmemVolumeManager.
+   * The block will be mapped to PmemDir/BlockPoolId/subdir#/subdir#/BlockId,
+   * in which PmemDir is a persistent memory volume chosen by PmemVolumeManager.
    *
    * @param length         The current length of the block.
    * @param blockIn        The block input stream. Should be positioned at the
@@ -79,110 +80,39 @@ public class PmemMappableBlockLoader extends MappableBlockLoader {
    */
   @Override
   MappableBlock load(long length, FileInputStream blockIn,
-                            FileInputStream metaIn, String blockFileName,
-                            ExtendedBlockId key)
+      FileInputStream metaIn, String blockFileName, ExtendedBlockId key)
       throws IOException {
     PmemMappedBlock mappableBlock = null;
-    String filePath = null;
+    String cachePath = null;
 
     FileChannel blockChannel = null;
-    RandomAccessFile file = null;
-    MappedByteBuffer out = null;
+    RandomAccessFile cacheFile = null;
     try {
       blockChannel = blockIn.getChannel();
       if (blockChannel == null) {
         throw new IOException("Block InputStream has no FileChannel.");
       }
+      cachePath = pmemVolumeManager.getCachePath(key);
+      cacheFile = new RandomAccessFile(cachePath, "rw");
+      blockChannel.transferTo(0, length, cacheFile.getChannel());
 
-      filePath = pmemVolumeManager.getCachePath(key);
-      file = new RandomAccessFile(filePath, "rw");
-      out = file.getChannel().
-          map(FileChannel.MapMode.READ_WRITE, 0, length);
-      if (out == null) {
-        throw new IOException("Failed to map the block " + blockFileName +
-            " to persistent storage.");
-      }
-      verifyChecksumAndMapBlock(out, length, metaIn, blockChannel,
-          blockFileName);
+      // Verify checksum for the cached data instead of block file.
+      // The file channel should be repositioned.
+      cacheFile.getChannel().position(0);
+      verifyChecksum(length, metaIn, cacheFile.getChannel(), blockFileName);
+
       mappableBlock = new PmemMappedBlock(length, key);
       LOG.info("Successfully cached one replica:{} into persistent memory"
-          + ", [cached path={}, length={}]", key, filePath, length);
+          + ", [cached path={}, length={}]", key, cachePath, length);
     } finally {
       IOUtils.closeQuietly(blockChannel);
-      if (out != null) {
-        NativeIO.POSIX.munmap(out);
-      }
-      IOUtils.closeQuietly(file);
+      IOUtils.closeQuietly(cacheFile);
       if (mappableBlock == null) {
-        LOG.debug("Delete {} due to unsuccessful mapping.", filePath);
-        FsDatasetUtil.deleteMappedFile(filePath);
+        LOG.debug("Delete {} due to unsuccessful mapping.", cachePath);
+        FsDatasetUtil.deleteMappedFile(cachePath);
       }
     }
     return mappableBlock;
-  }
-
-  /**
-   * Verifies the block's checksum meanwhile maps block to persistent memory.
-   * This is an I/O intensive operation.
-   */
-  private void verifyChecksumAndMapBlock(
-      MappedByteBuffer out, long length, FileInputStream metaIn,
-      FileChannel blockChannel, String blockFileName)
-      throws IOException {
-    // Verify the checksum from the block's meta file
-    // Get the DataChecksum from the meta file header
-    BlockMetadataHeader header =
-        BlockMetadataHeader.readHeader(new DataInputStream(
-            new BufferedInputStream(metaIn, BlockMetadataHeader
-                .getHeaderSize())));
-    FileChannel metaChannel = null;
-    try {
-      metaChannel = metaIn.getChannel();
-      if (metaChannel == null) {
-        throw new IOException("Cannot get FileChannel from " +
-            "Block InputStream meta file.");
-      }
-      DataChecksum checksum = header.getChecksum();
-      final int bytesPerChecksum = checksum.getBytesPerChecksum();
-      final int checksumSize = checksum.getChecksumSize();
-      final int numChunks = (8 * 1024 * 1024) / bytesPerChecksum;
-      ByteBuffer blockBuf = ByteBuffer.allocate(numChunks * bytesPerChecksum);
-      ByteBuffer checksumBuf = ByteBuffer.allocate(numChunks * checksumSize);
-      // Verify the checksum
-      int bytesVerified = 0;
-      while (bytesVerified < length) {
-        Preconditions.checkState(bytesVerified % bytesPerChecksum == 0,
-            "Unexpected partial chunk before EOF");
-        assert bytesVerified % bytesPerChecksum == 0;
-        int bytesRead = fillBuffer(blockChannel, blockBuf);
-        if (bytesRead == -1) {
-          throw new IOException(
-              "Checksum verification failed for the block " + blockFileName +
-                  ": premature EOF");
-        }
-        blockBuf.flip();
-        // Number of read chunks, including partial chunk at end
-        int chunks = (bytesRead + bytesPerChecksum - 1) / bytesPerChecksum;
-        checksumBuf.limit(chunks * checksumSize);
-        fillBuffer(metaChannel, checksumBuf);
-        checksumBuf.flip();
-        checksum.verifyChunkedSums(blockBuf, checksumBuf, blockFileName,
-            bytesVerified);
-
-        // / Copy data to persistent file
-        out.put(blockBuf);
-        // positioning the
-        bytesVerified += bytesRead;
-
-        // Clear buffer
-        blockBuf.clear();
-        checksumBuf.clear();
-      }
-      // Forces to write data to storage device containing the mapped file
-      out.force();
-    } finally {
-      IOUtils.closeQuietly(metaChannel);
-    }
   }
 
   @Override
@@ -211,8 +141,36 @@ public class PmemMappableBlockLoader extends MappableBlockLoader {
   }
 
   @Override
+  public boolean isNativeLoader() {
+    return false;
+  }
+
+  @Override
+  public MappableBlock getRecoveredMappableBlock(
+      File cacheFile, String bpid, byte volumeIndex) throws IOException {
+    ExtendedBlockId key = new ExtendedBlockId(getBlockId(cacheFile), bpid);
+    MappableBlock mappableBlock = new PmemMappedBlock(cacheFile.length(), key);
+    PmemVolumeManager.getInstance().recoverBlockKeyToVolume(key, volumeIndex);
+
+    String path = PmemVolumeManager.getInstance().getCachePath(key);
+    long length = mappableBlock.getLength();
+    LOG.info("Recovering persistent memory cache for block {}, " +
+        "path = {}, length = {}", key, path, length);
+    return mappableBlock;
+  }
+
+  /**
+   * Parse the file name and get the BlockId.
+   */
+  public long getBlockId(File file) {
+    return Long.parseLong(file.getName());
+  }
+
+  @Override
   void shutdown() {
-    LOG.info("Clean up cache on persistent memory during shutdown.");
-    PmemVolumeManager.getInstance().cleanup();
+    if (!cacheRecoveryEnabled) {
+      LOG.info("Clean up cache on persistent memory during shutdown.");
+      PmemVolumeManager.getInstance().cleanup();
+    }
   }
 }

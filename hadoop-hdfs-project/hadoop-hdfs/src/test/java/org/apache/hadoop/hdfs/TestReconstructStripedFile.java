@@ -570,7 +570,7 @@ public class TestReconstructStripedFile {
       barrier.await();
       DataNodeFaultInjector.set(oldInjector);
       for (final DataNode curDn : cluster.getDataNodes()) {
-        GenericTestUtils.waitFor(() -> curDn.getXceiverCount() > 1, 10, 60000);
+        GenericTestUtils.waitFor(() -> curDn.getXceiverCount() <= 1, 10, 60000);
         assertEquals(0, curDn.getXmitsInProgress());
       }
     }

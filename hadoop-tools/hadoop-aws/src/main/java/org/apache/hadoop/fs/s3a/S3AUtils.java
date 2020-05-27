@@ -34,7 +34,6 @@ import com.amazonaws.services.dynamodbv2.model.ResourceNotFoundException;
 import com.amazonaws.services.s3.model.AmazonS3Exception;
 import com.amazonaws.services.s3.model.MultiObjectDeleteException;
 import com.amazonaws.services.s3.model.S3ObjectSummary;
-import com.amazonaws.thirdparty.apache.http.conn.ssl.SSLConnectionSocketFactory;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
@@ -49,10 +48,10 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.PathFilter;
 import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.hadoop.fs.s3a.auth.IAMInstanceCredentialsProvider;
+import org.apache.hadoop.fs.s3a.impl.NetworkBinding;
 import org.apache.hadoop.fs.s3native.S3xLoginHelper;
 import org.apache.hadoop.net.ConnectTimeoutException;
 import org.apache.hadoop.security.ProviderUtils;
-import org.apache.hadoop.security.ssl.OpenSSLSocketFactory;
 import org.apache.hadoop.util.VersionInfo;
 
 import com.google.common.collect.Lists;
@@ -60,7 +59,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
-import javax.net.ssl.HostnameVerifier;
 import java.io.Closeable;
 import java.io.EOFException;
 import java.io.FileNotFoundException;
@@ -84,9 +82,13 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 
 import static org.apache.commons.lang3.StringUtils.isEmpty;
 import static org.apache.hadoop.fs.s3a.Constants.*;
+import static org.apache.hadoop.fs.s3a.impl.ErrorTranslation.isUnknownBucket;
+import static org.apache.hadoop.fs.s3a.impl.MultiObjectDeleteSupport.translateDeleteException;
+import static org.apache.hadoop.io.IOUtils.cleanupWithLogger;
 
 /**
  * Utility methods for S3A code.
@@ -248,6 +250,18 @@ public final class S3AUtils {
 
       // the object isn't there
       case 404:
+        if (isUnknownBucket(ase)) {
+          // this is a missing bucket
+          ioe = new UnknownStoreException(path, ase);
+        } else {
+          // a normal unknown object
+          ioe = new FileNotFoundException(message);
+          ioe.initCause(ase);
+        }
+        break;
+
+      // this also surfaces sometimes and is considered to
+      // be ~ a not found exception.
       case 410:
         ioe = new FileNotFoundException(message);
         ioe.initCause(ase);
@@ -287,7 +301,7 @@ public final class S3AUtils {
       case 200:
         if (exception instanceof MultiObjectDeleteException) {
           // failure during a bulk delete
-          return translateMultiObjectDeleteException(message,
+          return translateDeleteException(message,
               (MultiObjectDeleteException) exception);
         }
         // other 200: FALL THROUGH
@@ -449,40 +463,6 @@ public final class S3AUtils {
       result = new AWSServiceIOException(message, ddbException);
     }
     return result;
-  }
-
-  /**
-   * A MultiObjectDeleteException is raised if one or more delete objects
-   * listed in a bulk DELETE operation failed.
-   * The top-level exception is therefore just "something wasn't deleted",
-   * but doesn't include the what or the why.
-   * This translation will extract an AccessDeniedException if that's one of
-   * the causes, otherwise grabs the status code and uses it in the
-   * returned exception.
-   * @param message text for the exception
-   * @param ex exception to translate
-   * @return an IOE with more detail.
-   */
-  public static IOException translateMultiObjectDeleteException(String message,
-      MultiObjectDeleteException ex) {
-    List<String> keys;
-    StringBuffer result = new StringBuffer(ex.getErrors().size() * 100);
-    result.append(message).append(": ");
-    String exitCode = "";
-    for (MultiObjectDeleteException.DeleteError error : ex.getErrors()) {
-      String code = error.getCode();
-      result.append(String.format("%s: %s: %s%n", code, error.getKey(),
-          error.getMessage()));
-      if (exitCode.isEmpty() ||  "AccessDenied".equals(code)) {
-        exitCode = code;
-      }
-    }
-    if ("AccessDenied".equals(exitCode)) {
-      return (IOException) new AccessDeniedException(result.toString())
-          .initCause(ex);
-    } else {
-      return new AWSS3IOException(result.toString(), ex);
-    }
   }
 
   /**
@@ -999,7 +979,7 @@ public final class S3AUtils {
   }
 
   /**
-   * Get a integer option >= the minimum allowed value.
+   * Get a integer option &gt;= the minimum allowed value.
    * @param conf configuration
    * @param key key to look up
    * @param defVal default value
@@ -1007,7 +987,7 @@ public final class S3AUtils {
    * @return the value
    * @throws IllegalArgumentException if the value is below the minimum
    */
-  static int intOption(Configuration conf, String key, int defVal, int min) {
+  public static int intOption(Configuration conf, String key, int defVal, int min) {
     int v = conf.getInt(key, defVal);
     Preconditions.checkArgument(v >= min,
         String.format("Value of %s: %d is below the minimum value %d",
@@ -1017,7 +997,7 @@ public final class S3AUtils {
   }
 
   /**
-   * Get a long option >= the minimum allowed value.
+   * Get a long option &gt;= the minimum allowed value.
    * @param conf configuration
    * @param key key to look up
    * @param defVal default value
@@ -1025,7 +1005,7 @@ public final class S3AUtils {
    * @return the value
    * @throws IllegalArgumentException if the value is below the minimum
    */
-  static long longOption(Configuration conf,
+  public static long longOption(Configuration conf,
       String key,
       long defVal,
       long min) {
@@ -1238,14 +1218,59 @@ public final class S3AUtils {
    * @param bucket Optional bucket to use to look up per-bucket proxy secrets
    * @return new AWS client configuration
    * @throws IOException problem creating AWS client configuration
+   *
+   * @deprecated use {@link #createAwsConf(Configuration, String, String)}
    */
+  @Deprecated
   public static ClientConfiguration createAwsConf(Configuration conf,
       String bucket)
+      throws IOException {
+    return createAwsConf(conf, bucket, null);
+  }
+
+  /**
+   * Create a new AWS {@code ClientConfiguration}. All clients to AWS services
+   * <i>MUST</i> use this or the equivalents for the specific service for
+   * consistent setup of connectivity, UA, proxy settings.
+   *
+   * @param conf The Hadoop configuration
+   * @param bucket Optional bucket to use to look up per-bucket proxy secrets
+   * @param awsServiceIdentifier a string representing the AWS service (S3,
+   * DDB, etc) for which the ClientConfiguration is being created.
+   * @return new AWS client configuration
+   * @throws IOException problem creating AWS client configuration
+   */
+  public static ClientConfiguration createAwsConf(Configuration conf,
+      String bucket, String awsServiceIdentifier)
       throws IOException {
     final ClientConfiguration awsConf = new ClientConfiguration();
     initConnectionSettings(conf, awsConf);
     initProxySupport(conf, bucket, awsConf);
     initUserAgent(conf, awsConf);
+    if (StringUtils.isNotEmpty(awsServiceIdentifier)) {
+      String configKey = null;
+      switch (awsServiceIdentifier) {
+      case AWS_SERVICE_IDENTIFIER_S3:
+        configKey = SIGNING_ALGORITHM_S3;
+        break;
+      case AWS_SERVICE_IDENTIFIER_DDB:
+        configKey = SIGNING_ALGORITHM_DDB;
+        break;
+      case AWS_SERVICE_IDENTIFIER_STS:
+        configKey = SIGNING_ALGORITHM_STS;
+        break;
+      default:
+        // Nothing to do. The original signer override is already setup
+      }
+      if (configKey != null) {
+        String signerOverride = conf.getTrimmed(configKey, "");
+        if (!signerOverride.isEmpty()) {
+          LOG.debug("Signer override for {}} = {}", awsServiceIdentifier,
+              signerOverride);
+          awsConf.setSignerOverride(signerOverride);
+        }
+      }
+    }
     return awsConf;
   }
 
@@ -1273,6 +1298,15 @@ public final class S3AUtils {
         DEFAULT_SOCKET_SEND_BUFFER, 2048);
     int sockRecvBuffer = intOption(conf, SOCKET_RECV_BUFFER,
         DEFAULT_SOCKET_RECV_BUFFER, 2048);
+    long requestTimeoutMillis = conf.getTimeDuration(REQUEST_TIMEOUT,
+        DEFAULT_REQUEST_TIMEOUT, TimeUnit.SECONDS, TimeUnit.MILLISECONDS);
+
+    if (requestTimeoutMillis > Integer.MAX_VALUE) {
+      LOG.debug("Request timeout is too high({} ms). Setting to {} ms instead",
+          requestTimeoutMillis, Integer.MAX_VALUE);
+      requestTimeoutMillis = Integer.MAX_VALUE;
+    }
+    awsConf.setRequestTimeout((int) requestTimeoutMillis);
     awsConf.setSocketBufferSizeHints(sockSendBuffer, sockRecvBuffer);
     String signerOverride = conf.getTrimmed(SIGNING_ALGORITHM, "");
     if (!signerOverride.isEmpty()) {
@@ -1298,12 +1332,7 @@ public final class S3AUtils {
         DEFAULT_SECURE_CONNECTIONS);
     awsConf.setProtocol(secureConnections ?  Protocol.HTTPS : Protocol.HTTP);
     if (secureConnections) {
-      OpenSSLSocketFactory.initializeDefaultFactory(
-              conf.getEnum(SSL_CHANNEL_MODE, DEFAULT_SSL_CHANNEL_MODE));
-      awsConf.getApacheHttpClientConfig().setSslSocketFactory(
-            new SSLConnectionSocketFactory(
-                    OpenSSLSocketFactory.getDefaultFactory(),
-                    (HostnameVerifier) null));
+      NetworkBinding.bindSSLChannelMode(conf, awsConf);
     }
   }
 
@@ -1414,7 +1443,7 @@ public final class S3AUtils {
    * @throws IOException anything in the closure, or iteration logic.
    */
   public static long applyLocatedFiles(
-      RemoteIterator<LocatedFileStatus> iterator,
+      RemoteIterator<? extends LocatedFileStatus> iterator,
       CallOnLocatedFileStatus eval) throws IOException {
     long count = 0;
     while (iterator.hasNext()) {
@@ -1434,7 +1463,7 @@ public final class S3AUtils {
    * @throws IOException anything in the closure, or iteration logic.
    */
   public static <T> List<T> mapLocatedFiles(
-      RemoteIterator<LocatedFileStatus> iterator,
+      RemoteIterator<? extends LocatedFileStatus> iterator,
       LocatedFileStatusMap<T> eval) throws IOException {
     final List<T> results = new ArrayList<>();
     applyLocatedFiles(iterator,
@@ -1608,26 +1637,17 @@ public final class S3AUtils {
   /**
    * Close the Closeable objects and <b>ignore</b> any Exception or
    * null pointers.
-   * (This is the SLF4J equivalent of that in {@code IOUtils}).
+   * This is obsolete: use
+   * {@link org.apache.hadoop.io.IOUtils#cleanupWithLogger(Logger, Closeable...)}
    * @param log the log to log at debug level. Can be null.
    * @param closeables the objects to close
    */
+  @Deprecated
   public static void closeAll(Logger log,
       Closeable... closeables) {
-    if (log == null) {
-      log = LOG;
-    }
-    for (Closeable c : closeables) {
-      if (c != null) {
-        try {
-          log.debug("Closing {}", c);
-          c.close();
-        } catch (Exception e) {
-          log.debug("Exception in closing {}", c, e);
-        }
-      }
-    }
+    cleanupWithLogger(log, closeables);
   }
+
   /**
    * Close the Closeable objects and <b>ignore</b> any Exception or
    * null pointers.
@@ -1706,6 +1726,21 @@ public final class S3AUtils {
     return conf.get(FS_S3A_BUCKET_PREFIX + bucket + '.' + baseKey);
   }
 
+  /**
+   * Turns a path (relative or otherwise) into an S3 key, adding a trailing
+   * "/" if the path is not the root <i>and</i> does not already have a "/"
+   * at the end.
+   *
+   * @param key s3 key or ""
+   * @return the with a trailing "/", or, if it is the root key, "",
+   */
+  public static String maybeAddTrailingSlash(String key) {
+    if (!key.isEmpty() && !key.endsWith("/")) {
+      return key + '/';
+    } else {
+      return key;
+    }
+  }
 
   /**
    * Path filter which ignores any file which starts with . or _.

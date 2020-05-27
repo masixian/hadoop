@@ -117,14 +117,14 @@ public class ThrottledAsyncChecker<K, V> implements AsyncChecker<K, V> {
    * will receive the same Future.
    */
   @Override
-  public Optional<ListenableFuture<V>> schedule(Checkable<K, V> target,
-                                                K context) {
+  public synchronized Optional<ListenableFuture<V>> schedule(
+      Checkable<K, V> target, K context) {
     if (checksInProgress.containsKey(target)) {
       return Optional.empty();
     }
 
-    if (completedChecks.containsKey(target)) {
-      final LastCheckResult<V> result = completedChecks.get(target);
+    final LastCheckResult<V> result = completedChecks.get(target);
+    if (result != null) {
       final long msSinceLastCheck = timer.monotonicNow() - result.completedAt;
       if (msSinceLastCheck < minMsBetweenChecks) {
         LOG.debug("Skipped checking {}. Time since last check {}ms " +

@@ -153,24 +153,27 @@ public class PassThroughRESTRequestInterceptor
       Set<String> statesQuery, String finalStatusQuery, String userQuery,
       String queueQuery, String count, String startedBegin, String startedEnd,
       String finishBegin, String finishEnd, Set<String> applicationTypes,
-      Set<String> applicationTags, Set<String> unselectedFields) {
+      Set<String> applicationTags, String name, Set<String> unselectedFields) {
     return getNextInterceptor().getApps(hsr, stateQuery, statesQuery,
         finalStatusQuery, userQuery, queueQuery, count, startedBegin,
         startedEnd, finishBegin, finishEnd, applicationTypes, applicationTags,
-        unselectedFields);
+        name, unselectedFields);
   }
 
   @Override
-  public ActivitiesInfo getActivities(HttpServletRequest hsr, String nodeId) {
-    return getNextInterceptor().getActivities(hsr, nodeId);
+  public ActivitiesInfo getActivities(HttpServletRequest hsr, String nodeId,
+      String groupBy) {
+    return getNextInterceptor().getActivities(hsr, nodeId, groupBy);
   }
 
   @Override
   public AppActivitiesInfo getAppActivities(HttpServletRequest hsr,
       String appId, String time, Set<String> requestPriorities,
-      Set<String> allocationRequestIds) {
+      Set<String> allocationRequestIds, String groupBy, String limit,
+      Set<String> actions, boolean summarize) {
     return getNextInterceptor().getAppActivities(hsr, appId, time,
-        requestPriorities, allocationRequestIds);
+        requestPriorities, allocationRequestIds, groupBy, limit,
+        actions, summarize);
   }
 
   @Override
@@ -361,5 +364,11 @@ public class PassThroughRESTRequestInterceptor
       YarnException, InterruptedException, IOException {
     return getNextInterceptor().updateApplicationTimeout(appTimeout, hsr,
         appId);
+  }
+
+  @Override
+  public Response signalToContainer(String containerId,
+      String command, HttpServletRequest req) throws AuthorizationException {
+    return getNextInterceptor().signalToContainer(containerId, command, req);
   }
 }

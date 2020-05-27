@@ -34,8 +34,6 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
 
 import org.apache.hadoop.hdfs.protocol.datatransfer.IOStreamPair;
 import org.slf4j.Logger;
@@ -48,6 +46,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.yarn.api.records.ContainerId;
+import org.apache.hadoop.yarn.api.records.LocalResource;
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.exceptions.ConfigurationException;
@@ -100,9 +99,9 @@ public abstract class ContainerExecutor implements Configurable {
   private final ConcurrentMap<ContainerId, Path> pidFiles =
       new ConcurrentHashMap<>();
   private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
-  private final ReadLock readLock = lock.readLock();
-  private final WriteLock writeLock = lock.writeLock();
   private String[] whitelistVars;
+  private int exitCodeFileTimeout =
+      YarnConfiguration.DEFAULT_NM_CONTAINER_EXECUTOR_EXIT_FILE_TIMEOUT;
 
   @Override
   public void setConf(Configuration conf) {
@@ -110,6 +109,9 @@ public abstract class ContainerExecutor implements Configurable {
     if (conf != null) {
       whitelistVars = conf.get(YarnConfiguration.NM_ENV_WHITELIST,
           YarnConfiguration.DEFAULT_NM_ENV_WHITELIST).split(",");
+      exitCodeFileTimeout = conf.getInt(
+          YarnConfiguration.NM_CONTAINER_EXECUTOR_EXIT_FILE_TIMEOUT,
+          YarnConfiguration.DEFAULT_NM_CONTAINER_EXECUTOR_EXIT_FILE_TIMEOUT);
     }
   }
 
@@ -126,6 +128,10 @@ public abstract class ContainerExecutor implements Configurable {
    * @throws IOException if initialization fails
    */
   public abstract void init(Context nmContext) throws IOException;
+
+  public void start() {}
+
+  public void stop() {}
 
   /**
    * This function localizes the JAR file on-demand.
@@ -259,6 +265,12 @@ public abstract class ContainerExecutor implements Configurable {
   public abstract boolean isContainerAlive(ContainerLivenessContext ctx)
       throws IOException;
 
+
+  public Map<String, LocalResource> getLocalResources(Container container)
+      throws IOException {
+    return container.getLaunchContext().getLocalResources();
+  }
+
   /**
    * Update cluster information inside container.
    *
@@ -290,7 +302,7 @@ public abstract class ContainerExecutor implements Configurable {
     Path pidPath = getPidFilePath(containerId);
 
     if (pidPath == null) {
-      LOG.warn(containerId + " is not active, returning terminated error");
+      LOG.warn("{} is not active, returning terminated error", containerId);
 
       return ExitCode.TERMINATED.getExitCode();
     }
@@ -301,7 +313,7 @@ public abstract class ContainerExecutor implements Configurable {
       throw new IOException("Unable to determine pid for " + containerId);
     }
 
-    LOG.info("Reacquiring " + containerId + " with pid " + pid);
+    LOG.info("Reacquiring {} with pid {}", containerId, pid);
 
     ContainerLivenessContext livenessContext = new ContainerLivenessContext
         .Builder()
@@ -316,13 +328,13 @@ public abstract class ContainerExecutor implements Configurable {
 
     // wait for exit code file to appear
     final int sleepMsec = 100;
-    int msecLeft = 2000;
+    int msecLeft = this.exitCodeFileTimeout;
     String exitCodeFile = ContainerLaunch.getExitCodeFile(pidPath.toString());
     File file = new File(exitCodeFile);
 
     while (!file.exists() && msecLeft >= 0) {
       if (!isContainerActive(containerId)) {
-        LOG.info(containerId + " was deactivated");
+        LOG.info("{} was deactivated", containerId);
 
         return ExitCode.TERMINATED.getExitCode();
       }
@@ -559,12 +571,7 @@ public abstract class ContainerExecutor implements Configurable {
    * @return the path of the pid-file for the given containerId.
    */
   protected Path getPidFilePath(ContainerId containerId) {
-    readLock.lock();
-    try {
-      return (this.pidFiles.get(containerId));
-    } finally {
-      readLock.unlock();
-    }
+    return this.pidFiles.get(containerId);
   }
 
   /**
@@ -710,12 +717,7 @@ public abstract class ContainerExecutor implements Configurable {
    * @return true if the container is active
    */
   protected boolean isContainerActive(ContainerId containerId) {
-    readLock.lock();
-    try {
-      return (this.pidFiles.containsKey(containerId));
-    } finally {
-      readLock.unlock();
-    }
+    return this.pidFiles.containsKey(containerId);
   }
 
   @VisibleForTesting
@@ -731,12 +733,7 @@ public abstract class ContainerExecutor implements Configurable {
    * of the launched process
    */
   public void activateContainer(ContainerId containerId, Path pidFilePath) {
-    writeLock.lock();
-    try {
-      this.pidFiles.put(containerId, pidFilePath);
-    } finally {
-      writeLock.unlock();
-    }
+    this.pidFiles.put(containerId, pidFilePath);
   }
 
   // LinuxContainerExecutor overrides this method and behaves differently.
@@ -754,7 +751,7 @@ public abstract class ContainerExecutor implements Configurable {
       ipAndHost[0] = address.getHostAddress();
       ipAndHost[1] = address.getHostName();
     } catch (UnknownHostException e) {
-      LOG.error("Unable to get Local hostname and ip for " + container
+      LOG.error("Unable to get Local hostname and ip for {}", container
           .getContainerId(), e);
     }
     return ipAndHost;
@@ -767,12 +764,7 @@ public abstract class ContainerExecutor implements Configurable {
    * @param containerId the container ID
    */
   public void deactivateContainer(ContainerId containerId) {
-    writeLock.lock();
-    try {
-      this.pidFiles.remove(containerId);
-    } finally {
-      writeLock.unlock();
-    }
+    this.pidFiles.remove(containerId);
   }
 
   /**
@@ -782,7 +774,7 @@ public abstract class ContainerExecutor implements Configurable {
    *          the Container
    */
   public void pauseContainer(Container container) {
-    LOG.warn(container.getContainerId() + " doesn't support pausing.");
+    LOG.warn("{} doesn't support pausing.", container.getContainerId());
     throw new UnsupportedOperationException();
   }
 
@@ -793,7 +785,7 @@ public abstract class ContainerExecutor implements Configurable {
    *          the Container
    */
   public void resumeContainer(Container container) {
-    LOG.warn(container.getContainerId() + " doesn't support resume.");
+    LOG.warn("{} doesn't support resume.", container.getContainerId());
     throw new UnsupportedOperationException();
   }
 
@@ -835,7 +827,7 @@ public abstract class ContainerExecutor implements Configurable {
       try {
         pid = ProcessIdFileReader.getProcessId(pidFile);
       } catch (IOException e) {
-        LOG.error("Got exception reading pid from pid-file " + pidFile, e);
+        LOG.error("Got exception reading pid from pid-file {}", pidFile, e);
       }
     }
 

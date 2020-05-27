@@ -41,6 +41,7 @@ import org.apache.hadoop.yarn.server.timeline.EntityGroupFSTimelineStore.AppStat
 import org.apache.hadoop.yarn.server.timeline.TimelineReader.Field;
 import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.junit.After;
+import org.junit.Assert;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -380,6 +381,16 @@ public class TestEntityGroupFSTimelineStore extends TimelineStoreTestUtils {
   }
 
   @Test
+  public void testNullCheckGetEntityTimelines() throws Exception {
+    try {
+      store.getEntityTimelines("YARN_APPLICATION", null, null, null, null,
+          null);
+    } catch (NullPointerException e) {
+      Assert.fail("NPE when getEntityTimelines called with Null EntityIds");
+    }
+  }
+
+  @Test
   public void testPluginRead() throws Exception {
     // Verify precondition
     assertEquals(EntityGroupPlugInForTest.class.getName(),
@@ -496,6 +507,23 @@ public class TestEntityGroupFSTimelineStore extends TimelineStoreTestUtils {
         store.stop();
       }
       fs.delete(userBase, true);
+    }
+  }
+
+  @Test
+  public void testScanActiveLogsWithInvalidFile() throws Exception {
+    Path invalidFile = new Path(testActiveDirPath, "invalidfile");
+    try {
+      if (!fs.exists(invalidFile)) {
+        fs.createNewFile(invalidFile);
+      }
+      store.scanActiveLogs();
+    } catch (StackOverflowError error) {
+      Assert.fail("EntityLogScanner crashed with StackOverflowError");
+    } finally {
+      if (fs.exists(invalidFile)) {
+        fs.delete(invalidFile, false);
+      }
     }
   }
 
